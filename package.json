@@ -1,0 +1,15 @@
+{
+  "name": "notes-9206f8",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Notes",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "pg": "^8.13.0",
+    "jsonwebtoken": "^9.0.2"
+  }
+}
