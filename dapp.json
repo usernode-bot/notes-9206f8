@@ -1,3 +1,7 @@
 {
-  "secrets": []
+  "name": "Notes",
+  "secrets": [],
+  "tests": [
+    { "name": "Notes dashboard loads", "path": "/?demo=1", "expectSelector": "#app" }
+  ]
 }

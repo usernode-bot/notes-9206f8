@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  
+
   <script>
   // usernode-dev-console@1
   (function () {
@@ -66,56 +66,704 @@
   <title>Notes</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script>tailwind.config = { darkMode: 'class' }</script>
+  <script src="https://social-vibecoding.usernodelabs.org/usernode-bridge/v1/bridge.js"></script>
+  <style>
+    .masonry { column-gap: 1rem; }
+    @media (min-width: 640px) { .masonry { column-count: 2; } }
+    @media (min-width: 1024px) { .masonry { column-count: 3; } }
+    @media (min-width: 1536px) { .masonry { column-count: 4; } }
+    .masonry > * { break-inside: avoid; margin-bottom: 1rem; }
+    textarea.autosize { resize: none; overflow: hidden; }
+  </style>
 </head>
-<body class="bg-zinc-950 text-zinc-100 min-h-screen flex flex-col items-center justify-center gap-8 p-4">
-  <h1 class="text-2xl font-bold">Notes</h1>
-
-  <button id="press-btn" class="w-32 h-32 rounded-full bg-violet-600 hover:bg-violet-500 active:scale-95 transition-all text-white text-xl font-bold shadow-lg shadow-violet-600/30">
-    Press!
-  </button>
-
-  <div id="count" class="text-lg text-zinc-400">0 total presses</div>
-
-  <div class="w-full max-w-sm">
-    <h2 class="text-sm font-medium text-zinc-500 mb-2 text-center">Leaderboard</h2>
-    <div id="leaderboard" class="space-y-1"></div>
-  </div>
+<body class="bg-zinc-950 text-zinc-100 min-h-screen">
+  <div id="app"></div>
 
   <script>
+  (function () {
+    'use strict';
+
+    // ── Transport ───────────────────────────────────────────────────────────
     const params = new URLSearchParams(window.location.search);
     const token = params.get('token') || '';
-    const headers = token ? { 'x-usernode-token': token } : {};
+    const DEMO = params.get('demo') === '1';
+    const authHeaders = token ? { 'x-usernode-token': token } : {};
 
-    async function loadLeaderboard() {
-      const res = await fetch('/api/leaderboard', { headers });
-      if (!res.ok) return;
-      const { leaderboard } = await res.json();
-      const el = document.getElementById('leaderboard');
-      if (!leaderboard.length) {
-        el.innerHTML = '<p class="text-center text-zinc-600 text-sm">No presses yet</p>';
-        return;
+    async function api(method, path, body) {
+      const opts = { method, headers: { ...authHeaders } };
+      if (body !== undefined) {
+        opts.headers['Content-Type'] = 'application/json';
+        opts.body = JSON.stringify(body);
       }
-      el.innerHTML = leaderboard.map((r, i) =>
-        '<div class="flex justify-between px-3 py-1 rounded ' + (i === 0 ? 'bg-violet-600/20 text-violet-300' : 'text-zinc-400') + '">' +
-        '<span>' + (i + 1) + '. ' + r.username + '</span>' +
-        '<span class="font-mono">' + r.presses + '</span></div>'
-      ).join('');
-      const total = leaderboard.reduce((s, r) => s + parseInt(r.presses), 0);
-      document.getElementById('count').textContent = total + ' total presses';
+      const res = await fetch(path, opts);
+      if (!res.ok) {
+        let msg = res.status + '';
+        try { msg = (await res.json()).error || msg; } catch (_) {}
+        const err = new Error(msg); err.status = res.status; throw err;
+      }
+      return res.status === 204 ? null : res.json();
     }
 
-    document.getElementById('press-btn').addEventListener('click', async () => {
-      try {
-        const res = await fetch('/api/press', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', ...headers },
-        });
-        if (res.ok) loadLeaderboard();
-        else if (res.status === 401) document.getElementById('count').textContent = 'Sign in to press!';
-      } catch {}
-    });
+    // ── Crypto ──────────────────────────────────────────────────────────────
+    // Key derivation: signMessage(CANONICAL_MSG) -> HKDF-SHA-256 -> a
+    // non-extractable AES-256-GCM session key. The signature and key never
+    // leave the device; the server only ever stores ciphertext.
+    const CANONICAL_MSG = 'Usernode Notes — encryption key v1';
+    const HKDF_SALT = 'usernode-notes/v1/salt';
+    const HKDF_INFO = 'usernode-notes/v1/aes-256-gcm';
+    const KEYCHECK_PLAINTEXT = 'usernode-notes-keycheck-ok';
+    const enc = new TextEncoder();
+    const dec = new TextDecoder();
 
-    loadLeaderboard();
+    let sessionKey = null; // CryptoKey, memory-only for this session
+
+    function b64encode(bytes) {
+      let s = '';
+      const arr = new Uint8Array(bytes);
+      for (let i = 0; i < arr.length; i++) s += String.fromCharCode(arr[i]);
+      return btoa(s);
+    }
+    function b64decode(str) {
+      const bin = atob(str);
+      const out = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+      return out;
+    }
+
+    async function deriveKeyFromSignature(signature) {
+      const ikm = enc.encode(String(signature));
+      const baseKey = await crypto.subtle.importKey('raw', ikm, 'HKDF', false, ['deriveKey']);
+      return crypto.subtle.deriveKey(
+        {
+          name: 'HKDF',
+          hash: 'SHA-256',
+          salt: enc.encode(HKDF_SALT),
+          info: enc.encode(HKDF_INFO),
+        },
+        baseKey,
+        { name: 'AES-GCM', length: 256 },
+        false, // non-extractable
+        ['encrypt', 'decrypt']
+      );
+    }
+
+    async function encryptJSON(obj) {
+      const iv = crypto.getRandomValues(new Uint8Array(12)); // 96-bit
+      const pt = enc.encode(JSON.stringify(obj));
+      const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, sessionKey, pt);
+      return b64encode(iv) + '.' + b64encode(ct); // iv.ciphertext, both base64
+    }
+
+    async function decryptJSON(blob) {
+      const dot = blob.indexOf('.');
+      if (dot < 0) throw new Error('bad blob');
+      const iv = b64decode(blob.slice(0, dot));
+      const ct = b64decode(blob.slice(dot + 1));
+      const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, sessionKey, ct);
+      return JSON.parse(dec.decode(pt));
+    }
+
+    async function encryptString(str) {
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, sessionKey, enc.encode(str));
+      return b64encode(iv) + '.' + b64encode(ct);
+    }
+    async function decryptString(blob) {
+      const dot = blob.indexOf('.');
+      const iv = b64decode(blob.slice(0, dot));
+      const ct = b64decode(blob.slice(dot + 1));
+      const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, sessionKey, ct);
+      return dec.decode(pt);
+    }
+
+    // Wait for the hosted bridge to attach its API.
+    function waitForBridge(timeoutMs) {
+      return new Promise((resolve) => {
+        const t0 = Date.now();
+        (function poll() {
+          if (typeof window.signMessage === 'function' &&
+              typeof window.getNodeAddress === 'function') return resolve(true);
+          if (Date.now() - t0 > timeoutMs) return resolve(false);
+          setTimeout(poll, 100);
+        })();
+      });
+    }
+
+    // ── App state ─────────────────────────────────────────────────────────
+    const state = {
+      screen: 'unlock',     // unlock | locked | error | app
+      notes: [],            // decrypted: { id, pinned, archived, color, created_at, updated_at, title, content, tags, _bad }
+      view: 'active',       // active | archive
+      search: '',
+      tagFilter: null,
+      colorFilter: null,
+      pinnedOnly: false,
+      editingId: null,      // note id open in editor, or 'new'
+      message: '',
+      staging: false,
+    };
+
+    const root = document.getElementById('app');
+
+    // Color palette: card background / accent classes.
+    const COLOR_BG = {
+      default: 'bg-zinc-900 border-zinc-800',
+      red: 'bg-red-950/60 border-red-900/60',
+      orange: 'bg-orange-950/60 border-orange-900/60',
+      yellow: 'bg-yellow-900/40 border-yellow-800/50',
+      green: 'bg-green-950/60 border-green-900/60',
+      teal: 'bg-teal-950/60 border-teal-900/60',
+      blue: 'bg-blue-950/60 border-blue-900/60',
+      purple: 'bg-purple-950/60 border-purple-900/60',
+      pink: 'bg-pink-950/60 border-pink-900/60',
+      gray: 'bg-zinc-800 border-zinc-700',
+    };
+    const COLOR_DOT = {
+      default: 'bg-zinc-600', red: 'bg-red-500', orange: 'bg-orange-500',
+      yellow: 'bg-yellow-400', green: 'bg-green-500', teal: 'bg-teal-500',
+      blue: 'bg-blue-500', purple: 'bg-purple-500', pink: 'bg-pink-500', gray: 'bg-zinc-400',
+    };
+    const COLOR_LIST = Object.keys(COLOR_BG);
+
+    function esc(s) {
+      return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
+
+    function relTime(iso) {
+      const d = new Date(iso);
+      const s = Math.floor((Date.now() - d.getTime()) / 1000);
+      if (s < 60) return 'just now';
+      const m = Math.floor(s / 60); if (m < 60) return m + 'm ago';
+      const h = Math.floor(m / 60); if (h < 24) return h + 'h ago';
+      const dd = Math.floor(h / 24); if (dd < 7) return dd + 'd ago';
+      return d.toLocaleDateString();
+    }
+
+    // ── Note <-> ciphertext ─────────────────────────────────────────────────
+    async function decryptNoteRow(row) {
+      const note = {
+        id: row.id, pinned: row.pinned, archived: row.archived, color: row.color || 'default',
+        created_at: row.created_at, updated_at: row.updated_at,
+        title: '', content: '', tags: [], _bad: false,
+      };
+      try {
+        const data = await decryptJSON(row.ciphertext);
+        note.title = data.title || '';
+        note.content = data.content || '';
+        note.tags = Array.isArray(data.tags) ? data.tags : [];
+      } catch (e) {
+        note._bad = true;
+      }
+      return note;
+    }
+
+    function payloadFor(note) {
+      return encryptJSON({ title: note.title || '', content: note.content || '', tags: note.tags || [] });
+    }
+
+    async function loadNotes() {
+      const { notes } = await api('GET', '/api/notes');
+      state.notes = await Promise.all(notes.map(decryptNoteRow));
+    }
+
+    // ── Unlock flow ─────────────────────────────────────────────────────────
+    async function unlock() {
+      state.screen = 'unlock';
+      state.message = '';
+      render();
+
+      const ready = await waitForBridge(8000);
+      if (!ready) { state.screen = 'locked'; render(); return; }
+
+      let sig;
+      try {
+        const res = await window.signMessage(CANONICAL_MSG);
+        sig = res && res.signature;
+        if (!sig) throw new Error('no signature returned');
+      } catch (e) {
+        // signMessage rejects in QR mode — show the "open in app" state.
+        state.screen = 'locked';
+        render();
+        return;
+      }
+
+      try {
+        sessionKey = await deriveKeyFromSignature(sig);
+      } catch (e) {
+        state.screen = 'error';
+        state.message = 'Could not derive your encryption key.';
+        render();
+        return;
+      }
+
+      // Key-verification token: confirm the derived key matches prior sessions.
+      try {
+        const { keycheck } = await api('GET', '/api/keycheck');
+        if (keycheck) {
+          let plain = null;
+          try { plain = await decryptString(keycheck); } catch (_) {}
+          if (plain !== KEYCHECK_PLAINTEXT) {
+            state.screen = 'error';
+            state.message = "Couldn't unlock your notes on this device — the wallet signature didn't match the one your notes were encrypted with. Your notes are safe and untouched.";
+            render();
+            return;
+          }
+        } else {
+          // First unlock: store the token.
+          await api('PUT', '/api/keycheck', { ciphertext: await encryptString(KEYCHECK_PLAINTEXT) });
+        }
+      } catch (e) {
+        state.screen = 'error';
+        state.message = 'Network error while verifying your key. Please retry.';
+        render();
+        return;
+      }
+
+      try {
+        await loadNotes();
+      } catch (e) {
+        state.screen = 'error';
+        state.message = 'Could not load your notes: ' + e.message;
+        render();
+        return;
+      }
+
+      // Staging-only demo seeding (client-side, since only the client has the key).
+      if (state.staging && DEMO) {
+        try { await seedDemoNotes(); } catch (e) { console.warn('demo seed failed', e); }
+      }
+
+      state.screen = 'app';
+      render();
+    }
+
+    async function seedDemoNotes() {
+      const already = state.notes.some(n => (n.title || '').indexOf('Staging demo') === 0);
+      if (already) return;
+      const demos = [
+        { title: 'Staging demo — Welcome', content: 'This is an encrypted demo note. Only your wallet can read it.', tags: ['demo'], color: 'yellow', pinned: true, archived: false },
+        { title: 'Staging demo — Shopping list', content: 'Coffee\nOat milk\nNotebooks', tags: ['demo', 'errands'], color: 'green', pinned: false, archived: false },
+        { title: 'Staging demo — Ideas', content: 'Try the color picker and tag filters above.', tags: ['demo', 'ideas'], color: 'blue', pinned: false, archived: false },
+        { title: 'Staging demo — Archived note', content: 'This one lives in the Archive view.', tags: ['demo'], color: 'purple', pinned: false, archived: true },
+      ];
+      for (const d of demos) {
+        const ciphertext = await encryptJSON({ title: d.title, content: d.content, tags: d.tags });
+        await api('POST', '/api/notes', { ciphertext, pinned: d.pinned, archived: d.archived, color: d.color });
+      }
+      await loadNotes();
+    }
+
+    // ── Mutations ───────────────────────────────────────────────────────────
+    async function createNote(fields) {
+      const note = { title: fields.title || '', content: fields.content || '', tags: fields.tags || [] };
+      const ciphertext = await payloadFor(note);
+      const { note: row } = await api('POST', '/api/notes', {
+        ciphertext, pinned: !!fields.pinned, archived: false, color: fields.color || 'default',
+      });
+      state.notes.unshift(await decryptNoteRow(row));
+    }
+
+    async function saveNote(note) {
+      const ciphertext = await payloadFor(note);
+      const { note: row } = await api('PATCH', '/api/notes/' + note.id, { ciphertext, color: note.color });
+      note.updated_at = row.updated_at;
+    }
+
+    async function patchFlags(note, flags) {
+      const { note: row } = await api('PATCH', '/api/notes/' + note.id, flags);
+      Object.assign(note, flags, { updated_at: row.updated_at });
+    }
+
+    async function deleteNote(note) {
+      await api('DELETE', '/api/notes/' + note.id);
+      state.notes = state.notes.filter(n => n.id !== note.id);
+    }
+
+    // ── Filtering ───────────────────────────────────────────────────────────
+    function allTags() {
+      const set = new Set();
+      state.notes.forEach(n => (n.tags || []).forEach(t => set.add(t)));
+      return Array.from(set).sort();
+    }
+
+    function visibleNotes() {
+      const q = state.search.trim().toLowerCase();
+      return state.notes.filter(n => {
+        if (state.view === 'archive') { if (!n.archived) return false; }
+        else { if (n.archived) return false; }
+        if (state.pinnedOnly && !n.pinned) return false;
+        if (state.colorFilter && n.color !== state.colorFilter) return false;
+        if (state.tagFilter && !(n.tags || []).includes(state.tagFilter)) return false;
+        if (q) {
+          const hay = ((n.title || '') + ' ' + (n.content || '') + ' ' + (n.tags || []).join(' ')).toLowerCase();
+          if (!hay.includes(q)) return false;
+        }
+        return true;
+      });
+    }
+
+    // ── Rendering ─────────────────────────────────────────────────────────
+    function render() {
+      if (state.screen === 'unlock') return renderUnlock();
+      if (state.screen === 'locked') return renderLocked();
+      if (state.screen === 'error') return renderError();
+      return renderApp();
+    }
+
+    function centered(inner) {
+      root.innerHTML =
+        '<div class="min-h-screen flex items-center justify-center p-6">' +
+        '<div class="max-w-md w-full text-center">' + inner + '</div></div>';
+    }
+
+    function renderUnlock() {
+      centered(
+        '<div class="mx-auto mb-5 w-14 h-14 rounded-2xl bg-violet-600/20 flex items-center justify-center text-2xl">🔒</div>' +
+        '<h1 class="text-xl font-semibold mb-2">Unlock your notes</h1>' +
+        '<p class="text-sm text-zinc-400 mb-6">Your notes are end-to-end encrypted on your device. We need a one-time wallet signature to derive your key. The signature never leaves your device.</p>' +
+        '<button id="unlock-btn" class="px-5 py-2.5 rounded-lg bg-violet-600 hover:bg-violet-500 font-medium">Unlock</button>' +
+        '<p class="mt-4 text-xs text-zinc-600">Waiting for the Usernode wallet…</p>'
+      );
+      const b = document.getElementById('unlock-btn');
+      if (b) b.addEventListener('click', unlock);
+    }
+
+    function renderLocked() {
+      centered(
+        '<div class="mx-auto mb-5 w-14 h-14 rounded-2xl bg-amber-500/20 flex items-center justify-center text-2xl">📱</div>' +
+        '<h1 class="text-xl font-semibold mb-2">Open this in the Usernode app</h1>' +
+        '<p class="text-sm text-zinc-400 mb-6">Unlocking your encrypted notes needs to sign a message with your wallet, which isn\'t available in this browser view. Open Notes inside the Usernode mobile app to continue.</p>' +
+        '<button id="retry-btn" class="px-4 py-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-sm">Try again</button>'
+      );
+      const b = document.getElementById('retry-btn');
+      if (b) b.addEventListener('click', unlock);
+    }
+
+    function renderError() {
+      centered(
+        '<div class="mx-auto mb-5 w-14 h-14 rounded-2xl bg-red-500/20 flex items-center justify-center text-2xl">⚠️</div>' +
+        '<h1 class="text-xl font-semibold mb-2">Couldn\'t unlock notes</h1>' +
+        '<p class="text-sm text-zinc-400 mb-6">' + esc(state.message) + '</p>' +
+        '<button id="retry-btn" class="px-4 py-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-sm">Try again</button>'
+      );
+      const b = document.getElementById('retry-btn');
+      if (b) b.addEventListener('click', unlock);
+    }
+
+    function colorPicker(current, prefix) {
+      return '<div class="flex flex-wrap gap-1.5">' + COLOR_LIST.map(c =>
+        '<button data-color="' + c + '" class="' + prefix + '-color w-6 h-6 rounded-full ' + COLOR_DOT[c] +
+        ' ring-offset-2 ring-offset-zinc-900 ' + (c === current ? 'ring-2 ring-white' : 'ring-1 ring-zinc-700') +
+        '" title="' + c + '"></button>'
+      ).join('') + '</div>';
+    }
+
+    function tagChips(tags) {
+      if (!tags || !tags.length) return '';
+      return '<div class="flex flex-wrap gap-1 mt-2">' + tags.map(t =>
+        '<span class="text-[11px] px-2 py-0.5 rounded-full bg-black/30 text-zinc-300">#' + esc(t) + '</span>'
+      ).join('') + '</div>';
+    }
+
+    function noteCard(n) {
+      const cls = COLOR_BG[n.color] || COLOR_BG.default;
+      if (n._bad) {
+        return '<div class="rounded-xl border border-red-900/60 bg-red-950/40 p-4 text-sm text-red-300">' +
+          '🔐 Couldn\'t decrypt this note.' +
+          '<div class="mt-2 text-right"><button data-del="' + n.id + '" class="card-del text-xs text-red-400 hover:text-red-200">Delete</button></div></div>';
+      }
+      const preview = n.content ? esc(n.content).replace(/\n/g, '<br>') : '<span class="text-zinc-500">No content</span>';
+      return '<div data-open="' + n.id + '" class="card group cursor-pointer rounded-xl border ' + cls + ' p-4 hover:shadow-lg hover:shadow-black/30 transition">' +
+        '<div class="flex items-start justify-between gap-2">' +
+          (n.title ? '<h3 class="font-semibold leading-snug break-words">' + esc(n.title) + '</h3>' : '<span></span>') +
+          (n.pinned ? '<span title="Pinned" class="text-violet-300 text-xs shrink-0">📌</span>' : '') +
+        '</div>' +
+        '<div class="text-sm text-zinc-300 mt-1 whitespace-pre-wrap break-words">' + preview + '</div>' +
+        tagChips(n.tags) +
+        '<div class="flex items-center justify-between mt-3 pt-2 border-t border-white/5">' +
+          '<span class="text-[11px] text-zinc-500">' + (n.updated_at ? 'Edited ' + relTime(n.updated_at) : '') + '</span>' +
+          '<div class="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition" onclick="event.stopPropagation()">' +
+            '<button data-pin="' + n.id + '" class="card-pin text-xs text-zinc-400 hover:text-white" title="Pin / unpin">' + (n.pinned ? 'Unpin' : 'Pin') + '</button>' +
+            '<button data-arch="' + n.id + '" class="card-arch text-xs text-zinc-400 hover:text-white" title="Archive">' + (n.archived ? 'Restore' : 'Archive') + '</button>' +
+            '<button data-del="' + n.id + '" class="card-del text-xs text-zinc-400 hover:text-red-300" title="Delete">Delete</button>' +
+          '</div>' +
+        '</div>' +
+      '</div>';
+    }
+
+    function renderApp() {
+      const tags = allTags();
+      const list = visibleNotes();
+      const pinned = list.filter(n => n.pinned);
+      const others = list.filter(n => !n.pinned);
+
+      const filterBar =
+        '<div class="flex flex-wrap items-center gap-2 mb-4">' +
+          '<input id="search" type="text" placeholder="Search notes…" value="' + esc(state.search) + '" ' +
+            'class="flex-1 min-w-[12rem] bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-violet-600">' +
+          '<button id="view-toggle" class="px-3 py-2 text-sm rounded-lg border border-zinc-800 ' +
+            (state.view === 'archive' ? 'bg-violet-600/20 text-violet-200' : 'bg-zinc-900 text-zinc-300') + '">' +
+            (state.view === 'archive' ? '← Back to notes' : 'Archive') + '</button>' +
+          '<button id="pin-filter" class="px-3 py-2 text-sm rounded-lg border border-zinc-800 ' +
+            (state.pinnedOnly ? 'bg-violet-600/20 text-violet-200' : 'bg-zinc-900 text-zinc-300') + '">📌 Pinned</button>' +
+        '</div>';
+
+      const colorFilterRow =
+        '<div class="flex items-center gap-2 mb-3 text-xs text-zinc-500">' +
+          '<span>Color:</span>' +
+          '<button data-cf="" class="cfilter w-5 h-5 rounded-full bg-zinc-700 ' + (!state.colorFilter ? 'ring-2 ring-white' : '') + '" title="all"></button>' +
+          COLOR_LIST.filter(c => c !== 'default').map(c =>
+            '<button data-cf="' + c + '" class="cfilter w-5 h-5 rounded-full ' + COLOR_DOT[c] + ' ' +
+            (state.colorFilter === c ? 'ring-2 ring-white' : '') + '" title="' + c + '"></button>'
+          ).join('') +
+        '</div>';
+
+      const tagRow = tags.length ?
+        '<div class="flex flex-wrap gap-1.5 mb-4">' +
+          tags.map(t => '<button data-tf="' + esc(t) + '" class="tfilter text-xs px-2.5 py-1 rounded-full border ' +
+            (state.tagFilter === t ? 'bg-violet-600 border-violet-500 text-white' : 'bg-zinc-900 border-zinc-800 text-zinc-300') +
+            '">#' + esc(t) + '</button>').join('') +
+          (state.tagFilter ? '<button id="clear-tag" class="text-xs px-2.5 py-1 rounded-full text-zinc-500 hover:text-white">clear</button>' : '') +
+        '</div>' : '';
+
+      let board = '';
+      if (!list.length) {
+        const emptyMsg = state.search || state.tagFilter || state.colorFilter
+          ? 'No notes match your filters.'
+          : state.view === 'archive' ? 'No archived notes.' : 'No notes yet — write your first one above.';
+        board = '<div class="text-center text-zinc-500 py-20 text-sm">' + emptyMsg + '</div>';
+      } else if (state.view === 'archive') {
+        board = '<div class="masonry">' + list.map(noteCard).join('') + '</div>';
+      } else {
+        if (pinned.length) {
+          board += '<h2 class="text-xs uppercase tracking-wide text-zinc-500 mb-2">Pinned</h2>' +
+            '<div class="masonry mb-6">' + pinned.map(noteCard).join('') + '</div>';
+          if (others.length) board += '<h2 class="text-xs uppercase tracking-wide text-zinc-500 mb-2">Others</h2>';
+        }
+        board += '<div class="masonry">' + others.map(noteCard).join('') + '</div>';
+      }
+
+      const composer = state.view === 'active' ?
+        '<div class="mb-6">' +
+          '<button id="composer-open" class="w-full text-left px-4 py-3 rounded-xl bg-zinc-900 border border-zinc-800 text-zinc-500 hover:border-zinc-700">' +
+            '✏️ Take a note…</button>' +
+        '</div>' : '';
+
+      root.innerHTML =
+        '<div class="max-w-6xl mx-auto px-4 py-6">' +
+          '<header class="flex items-center justify-between mb-1">' +
+            '<h1 class="text-2xl font-bold flex items-center gap-2">📝 Notes' +
+              (state.staging ? '<span class="text-[10px] uppercase tracking-wide bg-amber-500/20 text-amber-300 px-2 py-0.5 rounded">staging</span>' : '') +
+            '</h1>' +
+          '</header>' +
+          '<p class="text-xs text-zinc-500 mb-5">🔐 Encrypted on your device. No one else — not even this app\'s server — can read your notes.</p>' +
+          composer +
+          filterBar + colorFilterRow + tagRow +
+          board +
+        '</div>' +
+        '<div id="modal-root"></div>';
+
+      wireApp();
+      if (state.editingId) openEditor(state.editingId);
+    }
+
+    function wireApp() {
+      const s = document.getElementById('search');
+      if (s) s.addEventListener('input', (e) => {
+        state.search = e.target.value;
+        renderBoardOnly();
+      });
+
+      const vt = document.getElementById('view-toggle');
+      if (vt) vt.addEventListener('click', () => {
+        state.view = state.view === 'archive' ? 'active' : 'archive';
+        state.pinnedOnly = false; render();
+      });
+      const pf = document.getElementById('pin-filter');
+      if (pf) pf.addEventListener('click', () => { state.pinnedOnly = !state.pinnedOnly; render(); });
+
+      const co = document.getElementById('composer-open');
+      if (co) co.addEventListener('click', () => { state.editingId = 'new'; openEditor('new'); });
+
+      document.querySelectorAll('.cfilter').forEach(b => b.addEventListener('click', () => {
+        const c = b.getAttribute('data-cf');
+        state.colorFilter = c || null; render();
+      }));
+      document.querySelectorAll('.tfilter').forEach(b => b.addEventListener('click', () => {
+        const t = b.getAttribute('data-tf');
+        state.tagFilter = state.tagFilter === t ? null : t; render();
+      }));
+      const ct = document.getElementById('clear-tag');
+      if (ct) ct.addEventListener('click', () => { state.tagFilter = null; render(); });
+
+      wireCards();
+    }
+
+    // Re-render keeping focus in the search box (used while typing a query).
+    function renderBoardOnly() {
+      const active = document.activeElement;
+      const caret = active && active.id === 'search' ? active.selectionStart : null;
+      render();
+      if (caret !== null) {
+        const s = document.getElementById('search');
+        if (s) { s.focus(); try { s.setSelectionRange(caret, caret); } catch (_) {} }
+      }
+    }
+
+    function wireCards() {
+      document.querySelectorAll('.card[data-open]').forEach(c => c.addEventListener('click', () => {
+        const id = parseInt(c.getAttribute('data-open'), 10);
+        state.editingId = id; openEditor(id);
+      }));
+      document.querySelectorAll('.card-pin').forEach(b => b.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        const n = noteById(parseInt(b.getAttribute('data-pin'), 10));
+        if (n) { await patchFlags(n, { pinned: !n.pinned }); render(); }
+      }));
+      document.querySelectorAll('.card-arch').forEach(b => b.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        const n = noteById(parseInt(b.getAttribute('data-arch'), 10));
+        if (n) { await patchFlags(n, { archived: !n.archived, pinned: false }); render(); }
+      }));
+      document.querySelectorAll('.card-del').forEach(b => b.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        const n = noteById(parseInt(b.getAttribute('data-del'), 10));
+        if (n && confirm('Delete this note permanently?')) { await deleteNote(n); render(); }
+      }));
+    }
+
+    function noteById(id) { return state.notes.find(n => n.id === id); }
+
+    // ── Editor modal ─────────────────────────────────────────────────────────
+    function openEditor(id) {
+      const isNew = id === 'new';
+      const existing = isNew ? null : noteById(id);
+      if (!isNew && !existing) { state.editingId = null; return; }
+      const draft = isNew
+        ? { title: '', content: '', tags: [], color: 'default', pinned: false }
+        : { title: existing.title || '', content: existing.content || '', tags: (existing.tags || []).slice(), color: existing.color || 'default', pinned: !!existing.pinned };
+
+      const modalRoot = document.getElementById('modal-root');
+      modalRoot.innerHTML =
+        '<div class="fixed inset-0 z-50 bg-black/60 flex items-start justify-center p-4 overflow-y-auto">' +
+          '<div class="ed-card w-full max-w-xl mt-12 rounded-2xl border ' + (COLOR_BG[draft.color] || COLOR_BG.default) + ' shadow-2xl">' +
+            '<div class="p-5">' +
+              '<input id="ed-title" placeholder="Title" value="' + esc(draft.title) + '" ' +
+                'class="w-full bg-transparent text-lg font-semibold focus:outline-none placeholder-zinc-500 mb-2">' +
+              '<textarea id="ed-content" placeholder="Take a note…" rows="6" ' +
+                'class="autosize w-full bg-transparent text-sm focus:outline-none placeholder-zinc-500">' + esc(draft.content) + '</textarea>' +
+              '<div id="ed-tags" class="flex flex-wrap items-center gap-1.5 mt-3"></div>' +
+              '<input id="ed-tag-input" placeholder="+ add tag, press Enter" ' +
+                'class="mt-2 w-full bg-black/20 rounded-lg px-3 py-1.5 text-xs focus:outline-none placeholder-zinc-500">' +
+              '<div class="mt-4 flex items-center justify-between gap-3">' +
+                colorPicker(draft.color, 'ed') +
+                '<label class="flex items-center gap-1.5 text-xs text-zinc-300 cursor-pointer select-none">' +
+                  '<input id="ed-pin" type="checkbox" ' + (draft.pinned ? 'checked' : '') + ' class="accent-violet-600"> Pin</label>' +
+              '</div>' +
+            '</div>' +
+            '<div class="flex items-center justify-between px-5 py-3 border-t border-white/10">' +
+              '<div>' + (isNew ? '' :
+                '<button id="ed-arch" class="text-xs text-zinc-400 hover:text-white mr-3">' + (existing.archived ? 'Restore' : 'Archive') + '</button>' +
+                '<button id="ed-del" class="text-xs text-zinc-400 hover:text-red-300">Delete</button>') + '</div>' +
+              '<div class="flex gap-2">' +
+                '<button id="ed-cancel" class="px-3 py-1.5 text-sm rounded-lg bg-zinc-800 hover:bg-zinc-700">Close</button>' +
+                '<button id="ed-save" class="px-3 py-1.5 text-sm rounded-lg bg-violet-600 hover:bg-violet-500">Save</button>' +
+              '</div>' +
+            '</div>' +
+          '</div>' +
+        '</div>';
+
+      function renderTags() {
+        const box = document.getElementById('ed-tags');
+        box.innerHTML = draft.tags.map((t, i) =>
+          '<span class="text-[11px] px-2 py-0.5 rounded-full bg-black/30 text-zinc-200 flex items-center gap-1">#' + esc(t) +
+          '<button data-rt="' + i + '" class="rt text-zinc-500 hover:text-red-300">×</button></span>'
+        ).join('');
+        box.querySelectorAll('.rt').forEach(b => b.addEventListener('click', () => {
+          draft.tags.splice(parseInt(b.getAttribute('data-rt'), 10), 1); renderTags();
+        }));
+      }
+      renderTags();
+
+      const titleEl = document.getElementById('ed-title');
+      const contentEl = document.getElementById('ed-content');
+      const tagInput = document.getElementById('ed-tag-input');
+      const pinEl = document.getElementById('ed-pin');
+
+      function autosize() { contentEl.style.height = 'auto'; contentEl.style.height = contentEl.scrollHeight + 'px'; }
+      contentEl.addEventListener('input', autosize); setTimeout(autosize, 0);
+
+      titleEl.addEventListener('input', () => draft.title = titleEl.value);
+      contentEl.addEventListener('input', () => draft.content = contentEl.value);
+      pinEl.addEventListener('change', () => draft.pinned = pinEl.checked);
+
+      tagInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          const v = tagInput.value.trim().replace(/^#/, '');
+          if (v && !draft.tags.includes(v)) { draft.tags.push(v); renderTags(); }
+          tagInput.value = '';
+        }
+      });
+
+      function reskin(color) {
+        const card = modalRoot.querySelector('.ed-card');
+        if (card) card.className = 'ed-card w-full max-w-xl mt-12 rounded-2xl border ' + (COLOR_BG[color] || COLOR_BG.default) + ' shadow-2xl';
+        document.querySelectorAll('.ed-color').forEach(b => {
+          const c = b.getAttribute('data-color');
+          b.className = 'ed-color w-6 h-6 rounded-full ' + COLOR_DOT[c] + ' ring-offset-2 ring-offset-zinc-900 ' +
+            (c === color ? 'ring-2 ring-white' : 'ring-1 ring-zinc-700');
+        });
+      }
+      document.querySelectorAll('.ed-color').forEach(b => b.addEventListener('click', () => {
+        draft.color = b.getAttribute('data-color'); reskin(draft.color);
+      }));
+
+      function close() { state.editingId = null; modalRoot.innerHTML = ''; render(); }
+
+      async function commit() {
+        try {
+          if (isNew) {
+            if (!draft.title.trim() && !draft.content.trim() && !draft.tags.length) { close(); return; }
+            await createNote(draft);
+          } else {
+            Object.assign(existing, { title: draft.title, content: draft.content, tags: draft.tags, color: draft.color });
+            if (draft.pinned !== existing.pinned) await patchFlags(existing, { pinned: draft.pinned });
+            await saveNote(existing);
+          }
+        } catch (e) { alert('Save failed: ' + e.message); return; }
+        close();
+      }
+
+      document.getElementById('ed-save').addEventListener('click', commit);
+      // Keep-style: closing auto-saves.
+      document.getElementById('ed-cancel').addEventListener('click', commit);
+      const edArch = document.getElementById('ed-arch');
+      if (edArch) edArch.addEventListener('click', async () => {
+        await patchFlags(existing, { archived: !existing.archived, pinned: false }); close();
+      });
+      const edDel = document.getElementById('ed-del');
+      if (edDel) edDel.addEventListener('click', async () => {
+        if (confirm('Delete this note permanently?')) { await deleteNote(existing); close(); }
+      });
+
+      titleEl.focus();
+    }
+
+    // ── Boot ────────────────────────────────────────────────────────────────
+    async function boot() {
+      try {
+        const envRes = await fetch('/api/env', { headers: authHeaders });
+        if (envRes.ok) state.staging = !!(await envRes.json()).staging;
+      } catch (_) {}
+      unlock();
+    }
+
+    boot();
+    window.__notes = state; // expose for debugging / in-loop browser
+  })();
   </script>
 </body>
 </html>
