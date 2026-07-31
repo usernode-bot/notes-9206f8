@@ -11,9 +11,13 @@ const JWT_SECRET = process.env.JWT_SECRET;
 // Paths that stay open without authentication. Add a path here (and add it
 // with `app.get`/`app.post` below) if you deliberately want it public.
 // Everything else requires a valid platform-issued JWT.
-const PUBLIC_API_PATHS = new Set(['/health']);
+const PUBLIC_API_PATHS = new Set(['/health', '/favicon.ico']);
 
 app.use(express.json());
+
+// Browsers request this on every page load; answer before auth so it
+// never falls through to the 401 landing page.
+app.get('/favicon.ico', (req, res) => res.status(204).end());
 
 // Verify platform-issued JWT if one was passed, then enforce auth on
 // anything not explicitly marked public. The iframe adds `?token=…`
